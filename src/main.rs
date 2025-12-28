@@ -1,7 +1,8 @@
 mod backend;
 
 use arboard::Clipboard;
-use dioxus::html::input_data::keyboard_types::Key;
+use dioxus::html::g::visibility;
+use dioxus::html::{g::to, input_data::keyboard_types::Key};
 use dioxus::prelude::*;
 use dioxus_desktop::{
     tao::dpi::{LogicalPosition, LogicalSize},
@@ -24,7 +25,7 @@ const TAILWIND_CSS: Asset = asset!("/assets/tailwind.css");
 
 #[derive(Clone)]
 pub struct WindowInfo {
-    pub is_visible: bool, // current window's status is visible or not
+    pub is_visible: bool, // represents the current window's status is visible or not
     pub visibility_setter: mpsc::UnboundedSender<bool>, // A mpsc sender for setting `is_visible`
 }
 
@@ -60,12 +61,10 @@ fn default_app_window_config() -> WindowBuilder {
 fn default_paste_window_config() -> WindowBuilder {
     WindowBuilder::new()
         .with_always_on_top(true)
-        .with_content_protection(false)
+        .with_content_protection(true)
         .with_decorations(false)
         .with_focused(true)
         .with_resizable(false)
-        .with_inner_size(LogicalSize::new(1710.0, 336.0)) // TODO: Using dynamic size & position based on primary monitor
-        .with_position(LogicalPosition::new(0.0, 771.5454545454545))
         .with_title("Paste")
         .with_transparent(true)
         .with_visible(false)
@@ -108,6 +107,24 @@ fn Paste() -> Element {
     let mut search_bar = use_signal(|| "".to_string());
     let mut selected_item_index = use_signal(|| 0);
 
+    // Change Window Size
+    use_effect({
+        to_owned![window];
+
+        move || {
+            to_owned![window];
+            spawn(async move {
+                if let Some(monitor) = window.current_monitor() {
+                    let size = monitor.size().to_logical::<f64>(monitor.scale_factor());
+                    let new_height = size.height / 3.3;
+                    let new_y_pos = size.height - new_height;
+                    window.set_inner_size(LogicalSize::new(size.width, new_height));
+                    window.set_outer_position(LogicalPosition::new(0.0, new_y_pos));
+                }
+            });
+        }
+    });
+
     // A hook to filter the clipboard items based on the user input
     // The search bar is used to filter the clipboard items
     let filtered_items = use_memo(move || {
@@ -133,7 +150,7 @@ fn Paste() -> Element {
     // A hook to set the visibility of the `Paste` window
     // A unbounded channel has been used to toggle the visibility of the `Paste` window
     let visibility_setter = use_hook(|| {
-        let window = window.clone();
+        to_owned![window];
         let (tx, mut rx) = mpsc::unbounded_channel::<bool>();
 
         spawn(async move {
@@ -179,119 +196,131 @@ fn Paste() -> Element {
     });
 
     // Register the `Paste` window to the window registry after component rendered
-    let vs2 = visibility_setter.clone();
-    use_effect(move || {
-        if let Ok(mut registry) = WINDOW_REGISTRY.write() {
-            registry.insert(
-                "Paste".to_string(),
-                WindowInfo {
-                    visibility_setter: vs2.clone(),
-                    is_visible: false,
-                },
-            );
+    use_effect({
+        to_owned![visibility_setter];
+
+        move || {
+            if let Ok(mut registry) = WINDOW_REGISTRY.write() {
+                registry.insert(
+                    "Paste".to_string(),
+                    WindowInfo {
+                        visibility_setter: visibility_setter.clone(),
+                        is_visible: false,
+                    },
+                );
+            }
+            log::trace!("Paste window registered");
         }
-        log::trace!("Paste window registered");
     });
 
     // Action Handler `do_paste`: Copy the selected clipboard item
     // Triggered when user select a clipboard item
-    let vs3 = visibility_setter.clone();
-    let do_paste = move |item: clipboard::Item| {
-        spawn(async move {
-            // BE Update: update system clipboard
-            let mut clipboard = Clipboard::new().unwrap();
+    let do_paste = {
+        to_owned![visibility_setter];
 
-            IS_INTERNAL_PASTE.store(true, Ordering::SeqCst);
+        move |item: clipboard::Item| {
+            spawn(async move {
+                // BE Update: update system clipboard
+                let mut clipboard = Clipboard::new().unwrap();
 
-            if item.content_type == ContentTypes::Text {
-                clipboard.set_text(&item.content).unwrap();
-            } else {
-                clipboard.set_image(b64_to_img_data(&item.content)).unwrap();
-            }
+                IS_INTERNAL_PASTE.store(true, Ordering::SeqCst);
 
-            // DB Update: Update the selected item's timestamp to now
-            update_timestamp(item.id).unwrap();
+                if item.content_type == ContentTypes::Text {
+                    clipboard.set_text(&item.content).unwrap();
+                } else {
+                    clipboard.set_image(b64_to_img_data(&item.content)).unwrap();
+                }
 
-            // UI Update: Move the selected item to the index[0]
-            let mut clipboard_items = clipboard_items.write();
-            if let Some(pos) = clipboard_items.iter().position(|i| i.id == item.id) {
-                let item = clipboard_items.remove(pos);
-                clipboard_items.insert(0, item);
-            }
+                // DB Update: Update the selected item's timestamp to now
+                update_timestamp(item.id).unwrap();
 
-            // UI Update: Reset the search bar and selected index
-            search_bar.set("".to_string());
-            selected_item_index.set(0);
+                // UI Update: Move the selected item to the index[0]
+                let mut clipboard_items = clipboard_items.write();
+                if let Some(pos) = clipboard_items.iter().position(|i| i.id == item.id) {
+                    let item = clipboard_items.remove(pos);
+                    clipboard_items.insert(0, item);
+                }
 
-            // UI Update: Hide the window
-            vs3.send(false).unwrap();
+                // UI Update: Reset the search bar and selected index
+                search_bar.set("".to_string());
+                selected_item_index.set(0);
 
-            // UX Update: refocusing preview application
-            Command::new("osascript")
-                .arg("-e")
-                .arg(
-                    r#"
-                    tell application "System Events"
-                        set visible of first process whose frontmost is true to false
-                    end tell
-                "#,
-                )
-                .output()
-                .unwrap();
+                // UI Update: Hide the window
+                visibility_setter.send(false).unwrap();
 
-            // TODO UX Update: Automatically pasting
-            // Currently not supported.
-            // Pasting immediately after user selection would require integration with macOS system APIs.
-        });
+                // UX Update: refocusing preview application
+                Command::new("osascript")
+                    .arg("-e")
+                    .arg(
+                        r#"
+                        tell application "System Events"
+                            set visible of first process whose frontmost is true to false
+                        end tell
+                    "#,
+                    )
+                    .output()
+                    .unwrap();
+
+                // TODO UX Update: Automatically pasting
+                // Currently not supported.
+                // Pasting immediately after user selection would require integration with macOS system APIs.
+            });
+            
+        }
     };
 
     // Keyboard handler: User can use arrow keys to navigate the clipboard items
-    let dp2 = do_paste.clone();
-    let handle_keydown = move |evt: KeyboardEvent| {
-        let max_len = filtered_items.read().len();
-        let filtered_items = filtered_items.read();
+    let handle_keydown = {
+        to_owned![visibility_setter, do_paste];
 
-        if max_len == 0 {
-            return;
-        }
+        move |evt: KeyboardEvent| {
+            to_owned![do_paste];
 
-        match evt.key() {
-            Key::ArrowRight => {
-                let current_idx = *selected_item_index.read();
-                selected_item_index.set((current_idx + 1) % max_len);
+            let max_len = filtered_items.read().len();
+            let filtered_items = filtered_items.read();
+
+            if max_len == 0 {
+                return;
             }
-            Key::ArrowLeft => {
-                let current_idx = *selected_item_index.read();
-                selected_item_index.set(if current_idx == 0 {
-                    max_len - 1
-                } else {
-                    current_idx - 1
-                });
-            }
-            Key::Character(c) => {
-                if evt.modifiers().contains(Modifiers::META) {
-                    if let Ok(digit) = c.parse::<usize>() {
-                        let idx = match digit {
-                            0 => 9,
-                            n => n.saturating_sub(1),
-                        };
 
-                        if let Some(item) = filtered_items.get(idx) {
-                            dp2.clone()(item.clone());
+            match evt.key() {
+                Key::ArrowRight => {
+                    let current_idx = *selected_item_index.read();
+                    selected_item_index.set((current_idx + 1) % max_len);
+                }
+                Key::ArrowLeft => {
+                    let current_idx = *selected_item_index.read();
+                    selected_item_index.set(if current_idx == 0 {
+                        max_len - 1
+                    } else {
+                        current_idx - 1
+                    });
+                }
+                Key::Character(c) => {
+                    if evt.modifiers().contains(Modifiers::META) {
+                        if let Ok(digit) = c.parse::<usize>() {
+                            let idx = match digit {
+                                0 => 9,
+                                n => n.saturating_sub(1),
+                            };
+
+                            if let Some(item) = filtered_items.get(idx) {
+                                do_paste(item.clone());
+                            }
                         }
                     }
                 }
-            }
-            Key::Enter => {
-                if let Some(item) = filtered_items.get(*selected_item_index.read()) {
-                    dp2.clone()(item.clone());
+                Key::Enter => {
+                    if let Some(item) = filtered_items.get(*selected_item_index.read()) {
+                        do_paste(item.clone());
+                    }
+                    visibility_setter.send(false).unwrap();
                 }
-                visibility_setter.send(false).unwrap();
+                Key::Escape => {
+                    visibility_setter.send(false).unwrap();
+                }
+                _ => {}
             }
-            Key::Escape => {
-                visibility_setter.send(false).unwrap();
-            }
-            _ => {}
         }
     };
 
@@ -328,8 +357,7 @@ fn Paste() -> Element {
                     } else {
                         {
                             filtered_items.read().iter().enumerate().map(|(index, item)| {
-                                let dp3 = do_paste.clone();
-                                let item = item.clone();
+                                to_owned![do_paste, item];
 
                                 rsx! {
                                     ClipboardCard {
@@ -338,8 +366,9 @@ fn Paste() -> Element {
                                         is_selected: index == *selected_item_index.read(),
                                         item: item.clone(),
                                         on_click: move |_| {
+                                            to_owned![do_paste];
                                             if index == *selected_item_index.read() {
-                                                dp3.clone()(item.clone());
+                                                do_paste(item.clone());
                                             } else {
                                                 selected_item_index.set(index);
                                             }
