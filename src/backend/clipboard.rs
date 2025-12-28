@@ -11,6 +11,7 @@ use std::env::current_exe;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
+use tokio::sync::mpsc;
 
 use crate::backend::macos::{current_focus_app_icon_path, current_focus_app_name};
 
@@ -51,18 +52,20 @@ pub struct Item {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ContentTypes {
-    TEXT,
-    IMAGE,
+    Text,
+    Image,
 }
 
 struct Handler {
     clipboard_ctx: Option<Clipboard>,
+    ui_notify_tx: mpsc::UnboundedSender<()>,
 }
 
 impl Handler {
-    fn new() -> Self {
+    fn new(ui_notify_tx: mpsc::UnboundedSender<()>) -> Self {
         Handler {
             clipboard_ctx: None,
+            ui_notify_tx,
         }
     }
 
@@ -86,13 +89,13 @@ impl ClipboardHandler for Handler {
     ///
     /// # Processing Logic
     /// 1. Loop Prevention
-    ///     Checks if the change is an internal paste action (`IS_INTERNAL_PASTE`).
-    ///     If so, do not save anything to the database.
+    ///    Checks if the change is an internal paste action (`IS_INTERNAL_PASTE`).
+    ///    If so, do not save anything to the database.
     /// 2. Sensitive Data Filtering
-    ///     Checks if the currently focused application is a password manager.
-    ///     If so, do not save anything to the database.
+    ///    Checks if the currently focused application is a password manager.
+    ///    If so, do not save anything to the database.
     /// 3. Persistence
-    ///     Save the clipboard contents to the SQLite database.
+    ///    Save the clipboard contents to the SQLite database.
     fn on_clipboard_change(&mut self) -> CallbackResult {
         // If the "system clipboard has changed" event is triggered by our own action, do not save anything to the database.
         // Because the event is triggered due to user selected a clipboard item in our Dioxus App.
@@ -121,6 +124,8 @@ impl ClipboardHandler for Handler {
             }
         }
 
+        self.ui_notify_tx.send(()).unwrap();
+
         CallbackResult::Next
     }
 }
@@ -134,8 +139,8 @@ impl ClipboardHandler for Handler {
 ///
 /// clipboard::listen(); // Start listening
 /// ```
-pub fn listen() {
-    let handler = Handler::new();
+pub fn listen(tx: mpsc::UnboundedSender<()>) {
+    let handler = Handler::new(tx);
     Master::new(handler).unwrap().run().unwrap();
 }
 
@@ -301,7 +306,8 @@ fn save_image(content: &ImageData) -> rusqlite::Result<()> {
         ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, content_bytes)
     {
         let mut bytes: Vec<u8> = Vec::new();
-        if let Ok(_) = img_buffer.write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png) {
+
+        if img_buffer.write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png).is_ok() {
             bytes
         } else {
             Vec::new()
@@ -341,8 +347,8 @@ fn row_to_item(row: &Row) -> rusqlite::Result<Item> {
     let timestamp: String = row.get(5)?;
 
     let content_type = match content_type.as_str() {
-        "IMAGE" => ContentTypes::IMAGE,
-        "TEXT" => ContentTypes::TEXT,
+        "IMAGE" => ContentTypes::Image,
+        "TEXT" => ContentTypes::Text,
         _ => unreachable!(),
     };
 
@@ -353,8 +359,8 @@ fn row_to_item(row: &Row) -> rusqlite::Result<Item> {
     };
 
     let content = match content_type {
-        ContentTypes::IMAGE => general_purpose::STANDARD.encode(&content_raw_bytes),
-        ContentTypes::TEXT => String::from_utf8_lossy(&content_raw_bytes).to_string(),
+        ContentTypes::Image => general_purpose::STANDARD.encode(&content_raw_bytes),
+        ContentTypes::Text => String::from_utf8_lossy(&content_raw_bytes).to_string(),
     };
 
     let timestamp = NaiveDateTime::parse_from_str(&timestamp, "%Y-%m-%d %H:%M:%S")
