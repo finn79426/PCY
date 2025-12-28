@@ -60,7 +60,7 @@ fn default_app_window_config() -> WindowBuilder {
 fn default_paste_window_config() -> WindowBuilder {
     WindowBuilder::new()
         .with_always_on_top(true)
-        .with_content_protection(true)
+        .with_content_protection(false)
         .with_decorations(false)
         .with_focused(true)
         .with_resizable(false)
@@ -173,7 +173,7 @@ fn Paste() -> Element {
         spawn(async move {
             while rx.recv().await.is_some() {
                 log::trace!("Received clipboard DB completed updating signal");
-                clipboard_items.set(clipboard::get_all_records().unwrap());
+                clipboard_items.set(clipboard::get_all_records().unwrap()); // BUG: Memory could goes insufficient if `get_all_records` returns massive amount of data
             }
         });
     });
